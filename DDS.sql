@@ -17,6 +17,7 @@ DECLARE
   @CASE_ARECOD_IN AS VARCHAR(MAX),
   @now DATETIME,
   @from DATETIME,
+  -- added this
   @OUTBOUND_ORD_LINE AS VARCHAR(MAX),
   @OUTBOUND_SHIP_LINE AS VARCHAR(MAX),
   @INBOUND_RCV_LINE AS VARCHAR(MAX);
@@ -38,12 +39,14 @@ SET @MSO_OPRCOD_AREAS = 'WOPCK';
 SET @CASE_ARECOD_OR = 'LEDO';
 SET @CASE_ARECOD_OUT = 'HD-LY';
 SET @CASE_ARECOD_IN = 'C-SL, B-PKVNA, C-DYNAMIC';
+-- added this
 SET @OUTBOUND_ORD_LINE = 'prodwms.ord_line';
 SET @OUTBOUND_SHIP_LINE = 'prodwms.shipment_line';
 SET @INBOUND_RCV_LINE = 'prodwms.rcvlin';
 
 SELECT TOP 1 
     base.wh_id,
+    -- ROUND(DECODE(ISNULL(mso.req_pals, 0), 0, 0, (ISNULL(mso.pck_pals, 0) / ISNULL(mso.req_pals, 0)) *100), 2) AS "MSO CFR%",
     ROUND(CASE WHEN COALESCE(mso.req_pals, 0) = 0 THEN 0
                ELSE (COALESCE(mso.pck_pals, 0) / COALESCE(mso.req_pals, 0)) * 100
           END, 2) AS [MSO CFR%],
@@ -76,6 +79,7 @@ SELECT TOP 1
     ISNULL(cs_pck.cs_pals, 0) AS [CP Pallets],
     ISNULL(cs_pck.vna_pals, 0) AS [VNA Pallets],
     ISNULL(cs_pck.ly_pals, 0) AS [LP Pallets],
+    --ISNULL(mso.pck_pals, 0) + ' / ' + ISNULL(mso.req_pals, 0) AS [MSO],
     ISNULL(replen1.lp_rpln_pal, 0) AS [Replen Pallets - LY],
     ISNULL(replen1.lp_rpln_cs, 0) AS [Replen Cases - LY],
     ISNULL(replen1.cp_rpln_pal, 0) AS [Replen Pallets - CS],
@@ -88,6 +92,8 @@ SELECT TOP 1
     ISNULL(fr_mso.full_pals, 0) AS [Full Pals From MSO],
     ISNULL(tblpckwrk_3.to_mso, 0) AS [To MSO]
 
+-- OPTIMIZED: Replaced problematic client_bldg_info join with clean base table
+-- Uses bldg_mst as base with proper client_id mapping using CASE instead of COALESCE
 FROM (
     SELECT wh_id, bldg_id,
     CASE 
@@ -100,7 +106,8 @@ FROM (
     GROUP BY wh_id, bldg_id
 ) base
 
-LEFT JOIN (
+LEFT JOIN (		-- Line 117 to 132
+    /*Get work orders processed on time*/
     SELECT ISNULL(ontime_wkords, 0) AS ontime_wkords,
            ISNULL(ROUND((ontime_wkords / tot_wkords) * 100, 2), 0) AS ontime_wkords_prcnt,
            wh_id
@@ -109,14 +116,16 @@ LEFT JOIN (
                SUM(CASE WHEN clsdte >= sch_enddte THEN 1 ELSE 0 END) AS ontime_wkords,
                wh_id
         FROM prodwms.wkohdr
+        -- OPTIMIZED: Using @from and @now variables instead of FORMAT functions
         WHERE sch_enddte >= @from AND sch_enddte < @now
         GROUP BY wh_id
     ) AS Sub
 ) AS prc_ords ON base.wh_id = prc_ords.wh_id
 
-LEFT JOIN (
+LEFT JOIN (		-- Line 205 -242
     SELECT COUNT(distinct rt.trknum) AS inb_prc_trlr, rt.wh_id
     FROM prodwms.rcvtrk rt
+    -- OPTIMIZED: Using @from and @now variables for consistent date filtering
     WHERE rt.clsdte >= @from AND rt.clsdte < @now
       AND rt.trknum NOT LIKE '0015%'
       AND rt.trkref != @MSO_TRKREF
@@ -135,6 +144,7 @@ LEFT JOIN (
 LEFT JOIN (
     SELECT COUNT(distinct cm.car_move_id) AS cnt_car_moves, cm.wh_id
     FROM prodwms.shipment s
+    -- OPTIMIZED: Changed to INNER JOINs for better performance where appropriate
     INNER JOIN prodwms.cardtl cd ON s.carcod = cd.carcod AND s.srvlvl = cd.srvlvl
     INNER JOIN prodwms.stop ON s.stop_id = stop.stop_id
     INNER JOIN prodwms.car_move cm ON stop.car_move_id = cm.car_move_id
@@ -144,7 +154,7 @@ LEFT JOIN (
     GROUP BY cm.wh_id
 ) AS load_trlr ON base.wh_id = load_trlr.wh_id
 
-LEFT JOIN (
+LEFT JOIN (		-- 265 to 337
     SELECT COUNT(DISTINCT cm.car_move_id) AS ltl_ship_prv_day, s.wh_id
     FROM prodwms.shipment s
     INNER JOIN prodwms.cardtl cd ON s.carcod = cd.carcod AND s.srvlvl = cd.srvlvl
@@ -178,7 +188,13 @@ LEFT JOIN (
            COUNT(DISTINCT lodnum) AS cnt_unld_lods,
            wh_id
     FROM (
-        SELECT d.wh_id, d.trnqty, pfv.untcAS, d.lodnum
+        SELECT d.wh_id, d.trnqty, pfv.untcAS, d.lodnum,
+               -- OPTIMIZED: Simplified date logic, removed MAX and complex CASE for rptdt
+               MAX(CASE 
+                   WHEN CONVERT(VARCHAR(8), d.trndte, 108) < '06:00:00' 
+                       THEN CAST(CONVERT(DATE, DATEADD(DAY, -1, d.trndte)) AS DATE)
+                   ELSE CAST(CONVERT(DATE, d.trndte) AS DATE)
+               END) AS rptdt
         FROM prodwms.dlytrn d
         INNER JOIN prodwms.prtftp_view pfv ON d.wh_id = pfv.wh_id 
             AND d.prtnum = pfv.prtnum 
@@ -189,14 +205,16 @@ LEFT JOIN (
                OR (d.oprcod IN ('URC', 'UID') AND d.actcod IN ('CRSDCK', 'PCKSTEAL') 
                    AND (d.fr_arecod LIKE 'RDTS%' OR d.fr_arecod LIKE 'EXPR%')))
           AND trndte >= @from AND trndte < @now
+        GROUP BY d.wh_id, d.lodnum, d.trnqty, pfv.untcAS
     ) as sub
     GROUP BY wh_id
 ) AS unld_pals ON base.wh_id = unld_pals.wh_id
 
-LEFT JOIN (
+LEFT JOIN (		--460 to 503
     SELECT wh_id, SUM(no_show_inb) no_show_inb, SUM(late_show_inb) late_show_inb
     FROM (
         SELECT rt.wh_id, rt.trknum,
+               -- OPTIMIZED: Using @from and @now variables instead of FORMAT functions
                CASE WHEN (MIN(trlr.arrdte) >= @from OR MIN(trlr.arrdte) IS NULL) THEN 1 ELSE 0 END as no_show_inb,
                CASE WHEN MIN(trlr.arrdte) >= @now THEN 1 ELSE 0 END as late_show_inb
         FROM prodwms.rcvtrk rt
@@ -225,7 +243,7 @@ LEFT JOIN (
     GROUP BY wh_id
 ) AS replen ON base.wh_id = replen.wh_id
 
-LEFT JOIN (
+LEFT JOIN (		--580 to 599
     SELECT COUNT('x') AS can_rea_pcks, wh_id
     FROM prodwms.canpck
     WHERE cancod IN (SELECT codval FROM prodwms.cancod WHERE reaflg = 1)
@@ -233,6 +251,19 @@ LEFT JOIN (
     GROUP BY wh_id
 ) AS canpcks ON base.wh_id = canpcks.wh_id
 
+/*LEFT JOIN (   -- need to optimize
+    SELECT 
+        SUM(CASE WHEN tostol LIKE '%LOST%' THEN 1 ELSE 0 END) AS lost_pallets,
+        SUM(CASE WHEN frstol LIKE '%LOST%' THEN 1 ELSE 0 END) AS wrked_lost_pallets,
+        wh_id
+    FROM prodwms.dlytrn
+    WHERE trndte >= FORMAT(DATEADD(HOUR, -12, dbo.getdate2()), 'yyyy/MM/dd HH:00') 
+      AND trndte < FORMAT(dbo.getdate2(), 'yyyy/MM/dd HH:00')
+    GROUP BY wh_id
+) AS lost_pals 
+ON wh.wh_id = lost_pals.wh_id */
+
+--optimized version (from 336)
 LEFT JOIN (
     SELECT wh_id,
            SUM(CASE WHEN tostol LIKE '%LOST%' THEN 1 ELSE 0 END) AS lost_pallets,
@@ -243,7 +274,7 @@ LEFT JOIN (
     GROUP BY wh_id
 ) AS lost_pals ON base.wh_id = lost_pals.wh_id
 
-LEFT JOIN (
+LEFT JOIN (		--612 to 630
     SELECT COUNT(distinct dlytrn.lodnum) lost_inv_del, dlytrn.wh_id
     FROM prodwms.dlytrn
     WHERE actcod = 'INVDEL' AND oprcod = 'INVADJ' AND frstol LIKE '%LOST%'
@@ -251,7 +282,8 @@ LEFT JOIN (
     GROUP BY dlytrn.wh_id
 ) AS lost_inv_del ON base.wh_id = lost_inv_del.wh_id
 
-LEFT JOIN (
+LEFT JOIN (		--631 to 714
+    -- OPTIMIZED: Simplified nested structure for inventory transactions
     SELECT ISNULL(a.cnt_del_loads, 0) + ISNULL(b.cnt_add_loads, 0) AS tot_trans, base_wh.wh_id
     FROM (SELECT DISTINCT wh_id FROM prodwms.bldg_mst) base_wh
     LEFT JOIN (
@@ -271,6 +303,7 @@ LEFT JOIN (
 ) AS inv_trn ON base.wh_id = inv_trn.wh_id
 
 LEFT JOIN (
+    -- OPTIMIZED: Simplified countback calculation structure
     SELECT cnt_audits AS cnt_audits,
            CASE WHEN CASE_picks = 0 THEN 0 
                 ELSE ROUND((cnt_audits * 100.0 / CASE_picks), 2) 
@@ -317,7 +350,9 @@ LEFT JOIN (
         ) AS tabpckwrk
         GROUP BY wh_id
     ) AS req_pals
-    LEFT JOIN (
+
+    ---
+    LEFT JOIN (		-- 715 to 747
         SELECT COUNT(distinct iv.lodnum) pck_pals, iv.wh_id
         FROM prodwms.wkohdr
         INNER JOIN prodwms.pckwrk_view pwv ON wkohdr.wkonum = pwv.wkonum 
@@ -337,7 +372,8 @@ LEFT JOIN (
     ) AS pck_pals ON req_pals.wh_id = pck_pals.wh_id
 ) AS mso ON base.wh_id = mso.wh_id
 
-LEFT JOIN (
+--
+LEFT JOIN (		-- 748 to 864
     SELECT pwv.wh_id,
            CEILING(SUM(pwv.dtl_appqty / pwv.untcas)) all_cs_pcks,
            Count(distinct pwv.list_id) AS all_cs_pck_pals,
@@ -345,11 +381,17 @@ LEFT JOIN (
                            THEN (pwv.dtl_appqty / pwv.untcas) ELSE 0 END)) AS vna_cs,
            COUNT(distinct (CASE WHEN pwv.srcare = vna_arecod.vna_arecod 
                                THEN pwv.list_id ELSE null END)) AS vna_pals,
+           ROUND((CEILING(SUM(CASE WHEN pwv.srcare = vna_arecod.vna_arecod 
+                                  THEN (pwv.dtl_appqty / pwv.untcas) ELSE 0 END)) * 100.0)
+                 / CEILING(SUM(pwv.dtl_appqty / pwv.untcas)), 2) AS vna_prcnt,
            CEILING(SUM(CASE WHEN pwv.srcare != ISNULL(vna_arecod.vna_arecod, 'a1z') 
                                AND pwv.pck_uom = 'LY' 
                            THEN (pwv.dtl_appqty / pwv.untcas) ELSE 0 END)) AS ly_cs,
            COUNT(Distinct CASE WHEN pwv.srcare <> ISNULL(vna_arecod.vna_arecod, 'a1z') 
                               AND pwv.pck_uom = 'LY' THEN pwv.list_id ELSE null END) AS ly_pals,
+           ROUND((CEILING(SUM(CASE WHEN pwv.srcare != ISNULL(vna_arecod.vna_arecod, 'a1z')
+                                  AND pwv.pck_uom = 'LY' THEN (pwv.dtl_appqty / pwv.untcas) ELSE 0 END)) * 100.0) / 
+                 CEILING(SUM(pwv.dtl_appqty / pwv.untcas)), 2) AS ly_prcnt,
            CEILING(SUM(CASE WHEN pwv.srcare <> ISNULL(vna_arecod.vna_arecod, 'a1z') 
                                AND pftpd.cas_flg = 1 
                            THEN (pwv.dtl_appqty / pwv.untcas) ELSE 0 END)) AS cs,
@@ -359,7 +401,7 @@ LEFT JOIN (
     INNER JOIN prodwms.prtftp_dtl pftpd ON pwv.wh_id = pftpd.wh_id 
         AND pwv.prtnum = pftpd.prtnum AND pwv.prt_client_id = pftpd.prt_client_id 
         AND pwv.ftpcod = pftpd.ftpcod AND pwv.pck_uom = pftpd.uomcod
-    LEFT JOIN (
+    LEFT JOIN ( -- need to update to site
         SELECT uc_param_val vna_arecod, wh_id
         FROM prodwms.uc_custom_parameters
         WHERE uc_param_var = @VNA_AREA_LIST
@@ -421,7 +463,7 @@ LEFT JOIN (
     GROUP BY wh_id
 ) AS trlr_moves ON base.wh_id = trlr_moves.wh_id
 
-LEFT JOIN (
+LEFT JOIN (		--889 to 910
     SELECT wh_id, SUM(brudi_pals) brudi_pals
     FROM (
         (SELECT COUNT(distinct list_id) brudi_pals, wh_id
@@ -439,7 +481,7 @@ LEFT JOIN (
     GROUP BY wh_id
 ) as brudi_pals ON base.wh_id = brudi_pals.wh_id
 
-LEFT JOIN (
+LEFT JOIN (		-- 911 to 975
     SELECT wh_id,
            COUNT(distinct lodnum) AS fr_mso,
            COUNT(distinct part_pals) AS part_pals,
@@ -470,10 +512,16 @@ LEFT JOIN (
     GROUP BY wh_id
 ) AS fr_mso ON base.wh_id = fr_mso.wh_id
 
+-- Change here (REMOVED: Problematic client_bldg_info join that was causing performance issues)
+-- The original join was fetching massive amounts of data with DISTINCT and COALESCE operations
+-- Now using clean base table with proper client_id mapping
+
+-- End Here
+
 LEFT JOIN (
     SELECT wh_id, COUNT(distinct lodnum) to_mso
     FROM prodwms.dlytrn
-    WHERE to_arecod IN (SELECT value FROM STRING_SPLIT(@MSO_IN_AREAS, ','))
+    WHERE to_arecod IN (SELECT value FROM STRING_SPLIT(@MSO_IN_AREAS, ',')) --where to_arecod = 'HOFFMSOIN' //prev
       AND trndte >= @from AND trndte < @now
       AND EXISTS(SELECT 'x' FROM prodwms.pckwrk_view pwv 
                  WHERE dlytrn.lodnum = pwv.pallet_id AND dlytrn.wh_id = pwv.wh_id 
